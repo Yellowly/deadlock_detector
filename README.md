@@ -7,7 +7,7 @@ This script can be run from the command line or by importing in python
 ## CLI
 This script can be called from the command line:
 ```bash
-python3 deadlock_detector [--print] [executable file] [executable arguments]
+python3 deadlock_detector [--print] <executable file> <executable arguments...>
 ```
 
 ## Import
