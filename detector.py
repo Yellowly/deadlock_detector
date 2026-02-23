@@ -335,6 +335,7 @@ if __name__=='__main__':
             # sleep(1.0)
             print(dd.gdb.execute('thread apply all bt 8'))
             print(dd.program.disp_locks())
+        dd.verify_lock_stacks()
             
 
     # dict(item.split('=') for item in data_string.split(','))
