@@ -13,6 +13,8 @@ python3 deadlock_detector [--print] [executable file] [executable arguments]
 ## Import
 Use a context manager to open up a DeadlockDetector:
 ```python
+from deadlock_detector import DeadlockDetector
+
 with DeadlockDetector({ executable file name }) as dd:
   dd.run({ executable arguments }) # Run the program using the deadlock detector
   dd.verify_lock_stacks() # Ensure all pthread_mutex_lock call stacks don't have deadlock
