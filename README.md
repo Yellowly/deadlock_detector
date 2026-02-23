@@ -2,6 +2,8 @@
 Basic python script for helping to check for deadlocks in C/C++ programs that use POSIX mutexes as the primary synchronization mechanism.
 
 # Usage
+This script can be run from the command line or by importing in python
+
 ## CLI
 This script can be called from the command line:
 ```bash
