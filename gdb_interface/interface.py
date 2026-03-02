@@ -90,14 +90,20 @@ class GDBInterface:
         
         return line
     
-    def execute(self, command: str | bytes, block: bool = True) -> GDBCmdOutput | None:
+    def execute(self, command: str | bytes, block: bool = True, force: bool = False) -> GDBCmdOutput | None:
+        forced = False
         with self.gdb_reader.output as output:
             last_pushed = output.rget(0)
             if not last_pushed or not isinstance(last_pushed, GDBSequenceEnd):
-                raise Exception("GDB is not accepting input")
+                if force:
+                    self.interrupt()
+                    forced = True
+                else:
+                    raise Exception("GDB is not accepting input")
             
             output.clear()
-                        
+        
+        if forced: self.wait_until(lambda r: isinstance(r, GDBSequenceEnd))        
         self.write_line(command)
         if block:
             return GDBCmdOutput(self.read_until(lambda l: isinstance(l, GDBSequenceEnd), True)[0])
@@ -156,7 +162,7 @@ class GDBInterface:
     
     def _verify_cmd_output(self, output: None | GDBCmdOutput) -> GDBCmdOutput:
         if output is None:
-            raise Exception("Failed to run program: No output\n", output)
+            raise Exception("Failed to run command: No output\n", output)
         return output
     
     def run(self, *args: str | int | float) -> GDBCmdOutput:
@@ -213,6 +219,9 @@ class GDBInterface:
     
     def delete_breakpoint(self, bp: Breakpoint | str):
         return self._verify_cmd_output(self.execute(f'-break-delete {bp.id if isinstance(bp, Breakpoint) else bp}'))
+    
+    def interrupt(self):
+        self.process.send_signal(2)
     
     def close(self):
         self.process.kill()

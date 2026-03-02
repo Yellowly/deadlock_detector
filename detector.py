@@ -13,6 +13,7 @@ class ProgramState:
         self._thread_data: dict[str, ThreadData] = dict()
         self._active_threads: set[ThreadData] = set()
         self._mutex_refs: dict[str, MutexRef] = dict()
+        self._cond_vars: dict[str, CondVarRef] = dict()
     
     def get_mutex(self, mutex_addr: str) -> MutexRef:
         res = self._mutex_refs.get(mutex_addr)
@@ -20,6 +21,13 @@ class ProgramState:
             res = MutexRef(mutex_addr)
             self._mutex_refs[mutex_addr] = res
         return res        
+    
+    def get_cond_var(self, cond_var_addr: str) -> CondVarRef:
+        res = self._cond_vars.get(cond_var_addr)
+        if res is None:
+            res = CondVarRef(cond_var_addr)
+            self._cond_vars[cond_var_addr] = res
+        return res  
     
     def get_thread(self, thread_id: str) -> ThreadData:
         res = self._thread_data.get(thread_id)
@@ -31,9 +39,29 @@ class ProgramState:
     
     def disp_locks(self) -> str:
         res = []
-        for thread in self._thread_data.values():
-            res.append(f"Thread {thread.thread_id} : {thread.active_locks}")
+        for thread in self._active_threads:
+            res.append(f"Thread {thread.thread_id} : {thread.active_locks}, {thread.joining_with}, {thread.blocking_cond}, {thread.pthread_t_id}")
         return '\n'.join(res)
+    
+    def verify_not_all_blocked(self):
+        blocked_cond = None
+        active_ids: set[str] = set()
+        joining_ids: set[str] = set()
+        for t in self._active_threads:
+            if t.pthread_t_id is not None: active_ids.add(t.pthread_t_id)
+            if t.blocking_cond is None and t.joining_with is None:
+                return
+            elif t.blocking_cond is not None:
+                if blocked_cond is None:
+                    blocked_cond = t.blocking_cond
+                elif t.blocking_cond != blocked_cond:
+                    # It would be better to verify that all threads that signal a cond are closed
+                    # but im lazy
+                    return
+            elif t.joining_with is not None:
+                joining_ids.add(t.joining_with)
+        if blocked_cond is not None and blocked_cond.pending_signals==0 and joining_ids.issubset(active_ids):
+            raise Exception(f"All threads are blocked")
     
 
 class MutexState(Enum):
@@ -99,7 +127,23 @@ class LockStack:
         return f"[{', '.join(str(m) for m in self.locks)}]"
             
                 
+class CondVarRef:
+    def __init__(self, addr: str):
+        self.addr = addr
+        self.signalled_by: set[ThreadData] = set()
+        self.waited_by: set[ThreadData] = set()
+        self._pending_signals: int = 0
         
+    @property
+    def pending_signals(self) -> int:
+        return self._pending_signals
+    
+    @pending_signals.setter
+    def pending_signals(self, new):
+        self._pending_signals = max(0, new)
+    
+    def __str__(self):
+        return self.addr
     
 class MutexRef:
     def __init__(self, addr: str):
@@ -117,12 +161,16 @@ class ThreadData:
     def __init__(self, program: ProgramState, thread_id: str):
         self._program = program
         self.thread_id = thread_id
+        self.start_routine: str | None = None
         self.mutex_calls: list[LockCallInfo] = []
         self.active_locks: LockStack = LockStack(self._program._active_threads)
         self.lock_stacks: list[LockStack] = []
         self.pending_lock: MutexRef | None = None
         self.started: bool = False
         self.ignore_locks: bool = False
+        self.joining_with: str | None = None
+        self.blocking_cond: CondVarRef | None = None
+        self.pthread_t_id: str | None = None
         
     def add_pending_lock(self, mutex: MutexRef):
         # print("Pending...", self.thread_id, str(mutex))
@@ -146,8 +194,16 @@ class ThreadData:
         # print("Aquired!!", self.thread_id, str(self.pending_lock))
         if self.pending_lock is None:
             raise Exception(f'Thread {self.thread_id} does not have a pending mutex', self.pending_lock)
+        
+        if self.blocking_cond is not None:
+            self.blocking_cond.waited_by.remove(self)
+            self.blocking_cond.pending_signals -= 1
+            # print("consuming signal", self.blocking_cond.addr, self.blocking_cond.pending_signals)
+            self.blocking_cond = None
+        
         if self.pending_lock.locked_by is not None:
             raise Exception(f'Thread {self.thread_id} attempted to aquire a mutex that is already locked', str(self.pending_lock), self.pending_lock.locked_by.thread_id)
+        
         self.pending_lock.locked_by = self
         self.active_locks.add(self.pending_lock)
         self.mutex_calls.append(LockCallInfo(self.pending_lock.addr, MutexState.locked))
@@ -166,7 +222,7 @@ class ThreadData:
         # print("Released!", self.thread_id, str(mutex))
         if mutex.locked_by != self:
             raise Exception(f"Thread {self.thread_id} attempted to unlock a mutex it has not locked", str(mutex), mutex.locked_by)
-        
+                
         mutex.locked_by = None
         self.mutex_calls.append(LockCallInfo(mutex.addr, MutexState.unlocked))
         
@@ -178,6 +234,38 @@ class ThreadData:
             
         self.active_locks.remove(mutex)
     
+    def wait_cond_var(self, cond_var: CondVarRef, mutex: MutexRef):
+        """Signify that this thread waits on a condition variable
+
+        Args:
+            cond_var (CondVarRef): Condition variable being waited for
+        """
+        # print("waiting on", cond_var.addr)
+        self.unlock_mutex(mutex)
+        cond_var.waited_by.add(self)
+        self.blocking_cond = cond_var
+        self._program.verify_not_all_blocked()
+        self.add_pending_lock(mutex)
+    
+    def signal_cond_var(self, cond_var: CondVarRef):
+        """Signify that this thread signals a condition variable
+
+        Args:
+            cond_var (CondVarRef): Condition variable being signalled
+        """
+        cond_var.signalled_by.add(self)
+        if len(cond_var.waited_by) > 0: cond_var.pending_signals += 1
+        # print("signalling", cond_var.addr, cond_var.pending_signals)
+        
+    def broadcast_cond_var(self, cond_var: CondVarRef):
+        """Signify that this thread broadcasts a condition variable
+
+        Args:
+            cond_var (CondVarRef): Condition variable being broadcasted
+        """
+        cond_var.signalled_by.add(self)
+        cond_var.pending_signals += len(cond_var.waited_by)
+    
     def opens_thread(self, new_thread: ThreadData):
         self._program._active_threads.add(new_thread)
     
@@ -186,6 +274,8 @@ class ThreadData:
         self._program._active_threads.remove(self)
         if len(self.active_locks) > 0:
             raise Exception(f'Thread {self.thread_id} was closed while still holding a lock')
+        self._program.verify_not_all_blocked()
+                
         
 class DeadlockDetector:
     def __init__(self, exe: str) -> None:
@@ -200,9 +290,21 @@ class DeadlockDetector:
         self.mutex_lock_bp = self.gdb.breakpoint('pthread_mutex_lock')[0].id
         self._breakpoint_funcs[self.mutex_lock_bp] = self._on_mutex_lock
         self._breakpoint_funcs[self.gdb.breakpoint('pthread_mutex_unlock')[0].id] = self._on_mutex_unlock
-        self._breakpoint_funcs[self.gdb.breakpoint('pthread_create')[0].id] = self._on_pthread_create
-        self.cond_wait_bp = self.gdb.breakpoint('pthread_cond_wait')[0].id
-        self._breakpoint_funcs[self.cond_wait_bp] = self._on_pthread_cond_wait
+        self.pthread_create_bp = self.gdb.breakpoint('pthread_create')[0].id
+        self._breakpoint_funcs[self.pthread_create_bp] = self._on_pthread_create
+        self.pthread_join_bp = self.gdb.breakpoint('pthread_join')[0].id
+        self._breakpoint_funcs[self.pthread_join_bp] = self._on_pthread_join
+        
+        self.cond_wait_bp = "-1"
+        
+        # Condition variables are optional
+        try:
+            self.cond_wait_bp = self.gdb.breakpoint('pthread_cond_wait')[0].id
+            self._breakpoint_funcs[self.cond_wait_bp] = self._on_pthread_cond_wait
+            self._breakpoint_funcs[self.gdb.breakpoint('pthread_cond_signal')[0].id] = self._on_pthread_cond_signal
+            self._breakpoint_funcs[self.gdb.breakpoint('pthread_cond_broadcast')[0].id] = self._on_pthread_cond_broadcast
+        except Exception as e:
+            pass
     
     def __enter__(self):
         return self
@@ -222,6 +324,7 @@ class DeadlockDetector:
         
     def _on_pthread_create(self, record: GDBExecRecord):
         thread = self.program.get_thread(record.data['thread-id'])
+        thread.start_routine = record.data['frame']['args'][2]['value']
         thread.ignore_locks = True
         # thread.unlock_mutex(mutex)
         
@@ -229,12 +332,26 @@ class DeadlockDetector:
         thread = self.program.get_thread(record.data['thread-id'])
         # print(record, '\n', record.data['frame']['args'][1].values())
         mutex = self.program.get_mutex(record.data['frame']['args'][1]['value'])
-        thread.unlock_mutex(mutex)
-        thread.add_pending_lock(mutex)
+        thread.wait_cond_var(self.program.get_cond_var(record.data['frame']['args'][0]['value']), mutex)
         
-    def _after_pthread_create(self, record: GDBExecRecord):
+    def _on_pthread_cond_signal(self, record: GDBExecRecord):
         thread = self.program.get_thread(record.data['thread-id'])
-        thread.started = True
+        cond_var = self.program.get_cond_var(record.data['frame']['args'][0]['value'])
+        thread.signal_cond_var(cond_var)
+    
+    def _on_pthread_cond_broadcast(self, record: GDBExecRecord):
+        thread = self.program.get_thread(record.data['thread-id'])
+        cond_var = self.program.get_cond_var(record.data['frame']['args'][0]['value'])
+        thread.broadcast_cond_var(cond_var)
+    
+    def _on_pthread_join(self, record: GDBExecRecord):
+        thread = self.program.get_thread(record.data['thread-id'])
+        thread.joining_with = hex(int(record.data['frame']['args'][0]['value']))
+        self.program.verify_not_all_blocked()
+    
+    # def _after_pthread_create(self, record: GDBExecRecord):
+    #     thread = self.program.get_thread(record.data['thread-id'])
+    #     thread.started = True
     
     def lock_frame_to_data(self, record: GDBExecRecord) -> tuple[ThreadData, MutexRef]:
         return self.program.get_thread(record.data['thread-id']), self.program.get_mutex(record.data['frame']['args'][0]['value'])
@@ -255,9 +372,11 @@ class DeadlockDetector:
                         func = self._breakpoint_funcs.get(bp)
                         if func: 
                             func(last_exec)
-                            if func in [self._on_mutex_lock, self._on_pthread_create, self._on_pthread_cond_wait]:
+                            if func in [self._on_mutex_lock, self._on_pthread_create, self._on_pthread_cond_wait, self._on_pthread_join]:
                                 new_bp = self.gdb.break_finish(thread.thread_id)[0].id
                                 temp_bps[new_bp] = bp
+                                # if func == self._on_pthread_cond_wait:
+                                #     print("bps", bp, self.cond_wait_bp)
                                 # print("created bp", new_bp)
                         else:
                             if bp in temp_bps:
@@ -265,7 +384,18 @@ class DeadlockDetector:
                                 # print("removing", bp)
                                 thread.ignore_locks = False
                                 if from_bp in [self.mutex_lock_bp, self.cond_wait_bp]:
+                                    # if from_bp == self.cond_wait_bp and thread.blocking_cond:
+                                    #     print("test", thread.blocking_cond.addr, thread.blocking_cond.pending_signals)
+                                    # elif from_bp == self.cond_wait_bp:
+                                    #     print("why none")
                                     thread.aquire_lock()
+                                elif from_bp in [self.pthread_join_bp]:
+                                    thread.joining_with = None
+                                elif from_bp in [self.pthread_create_bp]:
+                                    for t in self.program._active_threads:
+                                        if t.pthread_t_id is None:
+                                            out = self.gdb._verify_cmd_output(self.gdb.execute(f"-thread-info {t.thread_id}"))
+                                            t.pthread_t_id = out.result.data['threads'][0]['target-id'].split()[1]
                                 
                                 self.gdb.delete_breakpoint(bp)
                                 # print(, 'deleting', bp)
@@ -293,9 +423,15 @@ class DeadlockDetector:
             comparing = threads.pop()
             for stack in comparing.lock_stacks:
                 # print(stack, len(stack.parallel_threads))
-                for thread in threads:
+                # test_self = False
+                for thread in threads:                        
                     if thread in stack.parallel_threads and any(not stack.valid_with(other) for other in thread.lock_stacks):
+                        # print(next(filter(lambda other: not stack.valid_with(cast(LockStack, other)), thread.lock_stacks)))
                         raise Exception("Deadlock detected", comparing, thread)
+                    # if thread.start_routine == comparing.start_routine:
+                    #     test_self = True
+                # if test_self and any(not stack.valid_with(other) for other in comparing.lock_stacks):
+                #     raise Exception("Deadlock detected", comparing, comparing)
         return True
     
     def on_thread_notif(self, record: GDBNotifyRecord):

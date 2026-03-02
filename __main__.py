@@ -1,5 +1,5 @@
 from detector import DeadlockDetector
-from gdb_interface.records import GDBInferiorRecord
+from gdb_interface.records import GDBInferiorRecord, GDBSequenceEnd
 
 if __name__ == '__main__':
     import argparse
@@ -19,10 +19,14 @@ if __name__ == '__main__':
         
         try:
             dd.run(*args.executable_args)
+        except KeyboardInterrupt:
+            print(traceback.format_exc())
+            print(dd.gdb.execute('thread apply all bt 8', force=True))
+            print(dd.program.disp_locks())
         except Exception as e:
             print("ERROR:", e)
             print(traceback.format_exc())
-            print(dd.gdb.execute('thread apply all bt 8'))
+            print(dd.gdb.execute('thread apply all bt 8', force=True))
             print(dd.program.disp_locks())
         
         dd.verify_lock_stacks()
