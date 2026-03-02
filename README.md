@@ -2,7 +2,7 @@
 Basic python script for helping to check for deadlocks in C/C++ programs that use POSIX mutexes as the primary synchronization mechanism.
 
 # Requirements
-Internally, this script calls the C/C++ program using GDB. As such, this script requires GDB to be installed, and that the program being debugged is compiled with the `-g` compiler flag.
+Internally, this script calls the C/C++ program using GDB. As such, this script requires GDB to be installed, and that the program being debugged is compiled with the `-g` compiler flag. Additionally, this program will not work for multi-processed programs.
 
 # Usage
 This script can be run from the command line or by importing in python
